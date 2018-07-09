@@ -1,12 +1,11 @@
-// Fast CUDA implementation of the Hungarian algorithm.
-// (maximum pay version)
+// Fast Block Distributed CUDA Implementation of the Hungarian Algorithm
 //
-// Satyendra Yadav and Paulo Lopes
-// 
-// Annex to the paper: Paulo Lopes, Satyendra Yadav et al., "Fast CUDA Implementation of the Hungarian Algorithm."
+// Annex to the paper:
+// Paulo A. C. Lopes, Satyendra Singh Yadav, Aleksandar Ilic, Sarat Kumar Patra , 
+// "Fast Block Distributed CUDA Implementation of the Hungarian Algorithm",
+// Journal Parallel Distributed Computing
 //
-//
-// Classical version of the Hungarian algorithm:
+// Hungarian algorithm:
 // (This algorithm was modified to result in an efficient GPU implementation, see paper)
 //
 // Initialize the slack matrix with the cost matrix, and then work with the slack matrix.
@@ -36,6 +35,7 @@
 // and subtract it from every element of each uncovered column.
 // Return to Step 4 without altering any stars, primes, or covered rows.
 
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -45,9 +45,7 @@
 #include <time.h>
 #include <random>
 #include <assert.h>
-
-// Uncomment to use on SM20, (without dynamic parallelism).
-// #define SM20
+#include <chrono>
 
 // Uncomment to use chars as the data type, otherwise use int
 // #define CHAR_DATA_TYPE
@@ -55,26 +53,48 @@
 // Uncomment to use a 4x4 predefined matrix for testing
 // #define USE_TEST_MATRIX
 
+// Comment to use managed variables instead of dynamic parallelism; usefull for debugging
+#define DYNAMIC
+
 #ifndef USE_TEST_MATRIX
-
+#ifdef _n_
+// These values are meant to be changed by scripts
+const int n = _n_;							// size of the cost/pay matrix
+const int range = _range_;					// defines the range of the random matrix.
+const int n_tests = 100;
+#else
 // User inputs: These values should be changed by the user
-
-const int n = 1024;						// size of the cost/pay matrix
+const int n = 2048;						// size of the cost/pay matrix
 const int range = n;					// defines the range of the random matrix.
-// Bellow are the resulting total pays for matrixes of sizes for sizes of 128, 256, 512, 1024, 2048, 4096, 8192
-// for range of 0 to 0.1n:	1408,	6144,	25600,		103423,		415744,		1671167,	6701055
-// for range of 0 to n:		16130,	64959,	261071,		1046350,	4189849,	16768289,	67091170
-// for range of 0 to 10n:	161909, 651152, 2613373,	10468839,	41907855,	167703929,	670949133
-
-const int log2_n = 10;					// log2(n) needs to be entered manually
-const int n_threads = 64;				// Number of threads used in small kernels grid size (typically grid size equal to n)
-										// Used in steps 3ini, 3, 4ini, 4a, 4b, 5a and 5b
-const int n_threads_reduction = 256;	// Number of threads used in the redution kernels in step 1 and 6
-const int n_blocks_reduction = 256;		// Number of blocks used in the redution kernels in step 1 and 6
-const int n_threads_full = 512;			// Number of threads used the largest grids sizes (typically grid size equal to n*n)
-										// Used in steps 2 and 6
+const int n_tests = 10;					// defines the number of tests performed
+#endif
 
 // End of user inputs
+
+#ifndef DYNAMIC
+#define MANAGED __managed__ 
+#define dh_checkCuda checkCuda
+#define dh_get_globaltime get_globaltime
+#define dh_get_timer_period get_timer_period
+#else
+#define dh_checkCuda d_checkCuda
+#define dh_get_globaltime d_get_globaltime
+#define dh_get_timer_period d_get_timer_period
+#define MANAGED
+#endif
+
+#define klog2(n) ((n==8)?3:((n==16)?4:((n==32)?5:((n==64)?6:((n==128)?7:((n==256)?8:((n==512)?9:((n==1024)?10:((n==2048)?11:((n==4096)?12:(n==8192)?13:0))))))))))
+#define kmin(x,y) ((x<y)?x:y)
+#define kmax(x,y) ((x>y)?x:y)
+
+const int log2_n = klog2(n);			// log2(n)
+const int n_threads = kmin(n,64);		// Number of threads used in small kernels grid size (typically grid size equal to n)
+										// Used in steps 3ini, 3, 4ini, 4a, 4b, 5a and 5b (64)
+const int n_threads_reduction = kmin(n, 256);		// Number of threads used in the redution kernels in step 1 and 6 (256)
+const int n_blocks_reduction = kmin(n, 256);		// Number of blocks used in the redution kernels in step 1 and 6 (256)
+const int n_threads_full = kmin(n, 512);			// Number of threads used the largest grids sizes (typically grid size equal to n*n)
+										// Used in steps 2 and 6 (512)
+const int seed = 45345;					// Initialization for the random number generator
 
 #else
 const int n = 4;
@@ -85,14 +105,17 @@ const int n_blocks_reduction = 2;
 const int n_threads_full = 2;
 #endif
 
-const int n_blocks = n / n_threads;					// Number of blocks used in small kernels grid size (typically grid size equal to n)
-const int n_blocks_full = n * n / n_threads_full;	// Number of blocks used the largest gris sizes (typically grid size equal to n*n)
-const int row_mask = (1 << log2_n) - 1;				// Used to extract the row from tha matrix position index (matrices are column wise)
-const int nrow = n, ncol = n;						// The matrix is square so the number of rows and columns is equal to n
-const int max_threads_per_block = 1024;				// The maximum number of threads per block
-const int seed = 45345;								// Initialization for the random number generator
+const int n_blocks = n / n_threads;									// Number of blocks used in small kernels grid size (typically grid size equal to n)
+const int n_blocks_full = n * n / n_threads_full;					// Number of blocks used the largest gris sizes (typically grid size equal to n*n)
+const int row_mask = (1 << log2_n) - 1;								// Used to extract the row from tha matrix position index (matrices are column wise)
+const int nrows = n, ncols = n;										// The matrix is square so the number of rows and columns is equal to n
+const int max_threads_per_block = 1024;								// The maximum number of threads per block
+const int columns_per_block_step_4 = 512;							// Number of columns per block in step 4
+const int n_blocks_step_4 = kmax(n / columns_per_block_step_4, 1);	// Number of blocks in step 4 and 2
+const int data_block_size = columns_per_block_step_4 * n;			// The size of a data block. Note that this can be bigger than the matrix size.
+const int log2_data_block_size = log2_n + klog2(columns_per_block_step_4);	// log2 of the size of a data block. Note that klog2 cannot handle very large sizes
 
-// For the selection of the used data type
+// For the selection of the data type used
 #ifndef CHAR_DATA_TYPE
 typedef int data;
 #define MAX_DATA INT_MAX
@@ -109,11 +132,12 @@ typedef unsigned char data;
 // Device variables have no prefix.
 
 #ifndef USE_TEST_MATRIX
-data pay[ncol][nrow];
+data pay[ncols][nrows];
 #else
 data pay[n][n] = { { 1, 2, 3, 4 }, { 2, 4, 6, 8 }, { 3, 6, 9, 12 }, { 4, 8, 12, 16 } };
 #endif
-int h_column_of_star_at_row[nrow];
+data h_cost[ncols][nrows];
+int h_column_of_star_at_row[nrows];
 int h_zeros_vector_size;
 int h_n_matches;
 bool h_found;
@@ -121,25 +145,32 @@ bool h_goto_5;
 
 // Device Variables
 
-__device__ data slack[nrow*ncol];						// The slack matrix
-__device__ int zeros[nrow*ncol];						// A vector with the position of the zeros in the slack matrix
-__device__ int zeros_vector_size;						// The size of the zeros vector
-__device__ int row_of_star_at_column[ncol];				// A vector that given the column j gives the row of the star at that column (or -1, no star)
-__device__ int column_of_star_at_row[nrow];				// A vector that given the row i gives the column of the star at that row (or -1, no star)
-__device__ int cover_row[nrow];							// A vector that given the row i indicates if it is covered (1- covered, 0- uncovered)
-__device__ int cover_column[ncol];						// A vector that given the column j indicates if it is covered (1- covered, 0- uncovered)
-__device__ int column_of_prime_at_row[nrow];			// A vector that given the row i gives the column of the prime at that row (or -1, no prime)
-__device__ int row_of_green_at_column[ncol];			// A vector that given the column j gives the row of the green at that column (or -1, no green)
-__device__ int column_of_zero_at_row[nrow];				// The column of the zero at row i, found on step 4a
+__device__ data slack[nrows*ncols];						// The slack matrix
+__device__ data min_in_rows[nrows];						// Minimum in rows
+__device__ data min_in_cols[ncols];						// Minimum in columns
+__device__ int zeros[nrows*ncols];						// A vector with the position of the zeros in the slack matrix
+__device__ int zeros_size_b[n_blocks_step_4];			// The number of zeros in block i
 
-__device__ int n_matches;								// Used in step 3 to count the number of matches found
-__device__ bool goto_5;									// After step 4b, goto step 5?
-__device__ bool found = false;							// Found a zero in step 4a?
+__device__ int row_of_star_at_column[ncols];			// A vector that given the column j gives the row of the star at that column (or -1, no star)
+__device__ int column_of_star_at_row[nrows];			// A vector that given the row i gives the column of the star at that row (or -1, no star)
+__device__ int cover_row[nrows];						// A vector that given the row i indicates if it is covered (1- covered, 0- uncovered)
+__device__ int cover_column[ncols];						// A vector that given the column j indicates if it is covered (1- covered, 0- uncovered)
+__device__ int column_of_prime_at_row[nrows];			// A vector that given the row i gives the column of the prime at that row  (or -1, no prime)
+__device__ int row_of_green_at_column[ncols];			// A vector that given the row j gives the column of the green at that row (or -1, no green)
 
-__device__ data max_in_mat_row[nrow];					// Used in step 1 to stores the maximum in rows
-__device__ data min_in_mat_col[ncol];					// Used in step 1 to stores the minimums in columns
+__device__ data max_in_mat_row[nrows];					// Used in step 1 to stores the maximum in rows
+__device__ data min_in_mat_col[ncols];					// Used in step 1 to stores the minimums in columns
 __device__ data d_min_in_mat_vect[n_blocks_reduction];	// Used in step 6 to stores the intermediate results from the first reduction kernel
 __device__ data d_min_in_mat;							// Used in step 6 to store the minimum
+
+MANAGED __device__ int zeros_size;					// The number fo zeros
+MANAGED __device__ int n_matches;					// Used in step 3 to count the number of matches found
+MANAGED __device__ bool goto_5;						// After step 4, goto step 5?
+MANAGED __device__ bool repeat_kernel;				// Needs to repeat the step 2 and step 4 kernel?
+#if defined(DEBUG) || defined(_DEBUG)
+MANAGED __device__ int n_covered_rows;				// Used in debug mode to check for the number of covered rows
+MANAGED __device__ int n_covered_columns;			// Used in debug mode to check for the number of covered columns
+#endif
 
 __shared__ extern data sdata[];							// For access to shared memory
 
@@ -147,53 +178,58 @@ __shared__ extern data sdata[];							// For access to shared memory
 // Device code
 // -------------------------------------------------------------------------------------
 
+#if defined(DEBUG) || defined(_DEBUG)
+__global__ void convergence_check() {
+	int i = blockDim.x * blockIdx.x + threadIdx.x;
+	if (cover_column[i]) atomicAdd((int*)&n_covered_columns, 1);
+	if (cover_row[i]) atomicAdd((int*)&n_covered_rows, 1);
+}
+
+#endif
+
 // Convenience function for checking CUDA runtime API results
 // can be wrapped around any runtime API call. No-op in release builds.
-inline
-#ifndef SM20
-__device__
-#endif
-cudaError_t checkCuda(cudaError_t result)
+inline __device__ cudaError_t d_checkCuda(cudaError_t result)
 {
 #if defined(DEBUG) || defined(_DEBUG)
 	if (result != cudaSuccess) {
-		fprintf(stderr, "CUDA Runtime Error: %s\n",
+		printf("CUDA Runtime Error: %s\n",
 			cudaGetErrorString(result));
 		assert(result == cudaSuccess);
 	}
 #endif
 	return result;
-}
+};
 
-__global__ void Init()
+__global__ void init()
 {
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
 	// initializations
 	//for step 2
-	if (i < nrow){
+	if (i < nrows){
 		cover_row[i] = 0;
 		column_of_star_at_row[i] = -1;
 	}
-	if (i < ncol){
+	if (i < ncols){
 		cover_column[i] = 0;
 		row_of_star_at_column[i] = -1;
 	}
 }
 
 // STEP 1.
-// a) Subtracting the maximum in each row by the row
+// a) Subtracting the row by the minimum in each row
 const int n_rows_per_block = n / n_blocks_reduction;
 
-__device__ void max_in_rows_warp_reduce(volatile data* sdata, int tid) {
-	if (n_threads_reduction >= 64 && n_rows_per_block < 64) sdata[tid] = max(sdata[tid], sdata[tid + 32]);
-	if (n_threads_reduction >= 32 && n_rows_per_block < 32) sdata[tid] = max(sdata[tid], sdata[tid + 16]);
-	if (n_threads_reduction >= 16 && n_rows_per_block < 16) sdata[tid] = max(sdata[tid], sdata[tid + 8]);
-	if (n_threads_reduction >= 8 && n_rows_per_block < 8) sdata[tid] = max(sdata[tid], sdata[tid + 4]);
-	if (n_threads_reduction >= 4 && n_rows_per_block < 4) sdata[tid] = max(sdata[tid], sdata[tid + 2]);
-	if (n_threads_reduction >= 2 && n_rows_per_block < 2) sdata[tid] = max(sdata[tid], sdata[tid + 1]);
+__device__ void min_in_rows_warp_reduce(volatile data* sdata, int tid) {
+	if (n_threads_reduction >= 64 && n_rows_per_block < 64) sdata[tid] = min(sdata[tid], sdata[tid + 32]);
+	if (n_threads_reduction >= 32 && n_rows_per_block < 32) sdata[tid] = min(sdata[tid], sdata[tid + 16]);
+	if (n_threads_reduction >= 16 && n_rows_per_block < 16) sdata[tid] = min(sdata[tid], sdata[tid + 8]);
+	if (n_threads_reduction >= 8 && n_rows_per_block < 8) sdata[tid] = min(sdata[tid], sdata[tid + 4]);
+	if (n_threads_reduction >= 4 && n_rows_per_block < 4) sdata[tid] = min(sdata[tid], sdata[tid + 2]);
+	if (n_threads_reduction >= 2 && n_rows_per_block < 2) sdata[tid] = min(sdata[tid], sdata[tid + 1]);
 }
 
-__global__ void max_in_rows()
+__global__ void calc_min_in_rows()
 {
 	__shared__ data sdata[n_threads_reduction];		// One temporary result for each thread.
 
@@ -202,27 +238,27 @@ __global__ void max_in_rows()
 	// One gets the line and column from the blockID and threadID.
 	unsigned int l = bid * n_rows_per_block + tid % n_rows_per_block;
 	unsigned int c = tid / n_rows_per_block;
-	unsigned int i = c * nrow + l;
+	unsigned int i = c * nrows + l;
 	const unsigned int gridSize = n_threads_reduction * n_blocks_reduction;
-	data thread_min = MIN_DATA;
+	data thread_min = MAX_DATA;
 
 	while (i < n * n) {
-		thread_min = max(thread_min, slack[i]);
+		thread_min = min(thread_min, slack[i]);
 		i += gridSize;  // go to the next piece of the matrix...
-		// gridSize = 2^k * n, so that each thread always processes the same line or column
+						// gridSize = 2^k * n, so that each thread always processes the same line or column
 	}
 	sdata[tid] = thread_min;
 
 	__syncthreads();
-	if (n_threads_reduction >= 1024 && n_rows_per_block < 1024) { if (tid < 512) { sdata[tid] = max(sdata[tid], sdata[tid + 512]); } __syncthreads(); }
-	if (n_threads_reduction >= 512 && n_rows_per_block < 512) { if (tid < 256) { sdata[tid] = max(sdata[tid], sdata[tid + 256]); } __syncthreads(); }
-	if (n_threads_reduction >= 256 && n_rows_per_block < 256) { if (tid < 128) { sdata[tid] = max(sdata[tid], sdata[tid + 128]); } __syncthreads(); }
-	if (n_threads_reduction >= 128 && n_rows_per_block < 128) { if (tid <  64) { sdata[tid] = max(sdata[tid], sdata[tid + 64]); } __syncthreads(); }
-	if (tid < 32) max_in_rows_warp_reduce(sdata, tid);
-	if (tid < n_rows_per_block) max_in_mat_row[bid*n_rows_per_block + tid] = sdata[tid];
+	if (n_threads_reduction >= 1024 && n_rows_per_block < 1024) { if (tid < 512) { sdata[tid] = min(sdata[tid], sdata[tid + 512]); } __syncthreads(); }
+	if (n_threads_reduction >= 512 && n_rows_per_block < 512) { if (tid < 256) { sdata[tid] = min(sdata[tid], sdata[tid + 256]); } __syncthreads(); }
+	if (n_threads_reduction >= 256 && n_rows_per_block < 256) { if (tid < 128) { sdata[tid] = min(sdata[tid], sdata[tid + 128]); } __syncthreads(); }
+	if (n_threads_reduction >= 128 && n_rows_per_block < 128) { if (tid <  64) { sdata[tid] = min(sdata[tid], sdata[tid + 64]); } __syncthreads(); }
+	if (tid < 32) min_in_rows_warp_reduce(sdata, tid);
+	if (tid < n_rows_per_block) min_in_rows[bid*n_rows_per_block + tid] = sdata[tid];
 }
 
-// b) subtracting the row by its minimum
+// a) Subtracting the column by the minimum in each column
 const int n_cols_per_block = n / n_blocks_reduction;
 
 __device__ void min_in_cols_warp_reduce(volatile data* sdata, int tid) {
@@ -234,7 +270,7 @@ __device__ void min_in_cols_warp_reduce(volatile data* sdata, int tid) {
 	if (n_threads_reduction >= 2 && n_cols_per_block < 2) sdata[tid] = min(sdata[tid], sdata[tid + 1]);
 }
 
-__global__ void min_in_cols()
+__global__ void calc_min_in_cols()
 {
 	__shared__ data sdata[n_threads_reduction];		// One temporary result for each thread
 
@@ -247,10 +283,10 @@ __global__ void min_in_cols()
 	data thread_min = MAX_DATA;
 
 	while (l < n) {
-		unsigned int i = c * nrow + l;
+		unsigned int i = c * nrows + l;
 		thread_min = min(thread_min, slack[i]);
 		l += gridSize / n;  // go to the next piece of the matrix...
-		// gridSize = 2^k * n, so that each thread always processes the same line or column
+							// gridSize = 2^k * n, so that each thread always processes the same line or column
 	}
 	sdata[tid] = thread_min;
 
@@ -260,16 +296,16 @@ __global__ void min_in_cols()
 	if (n_threads_reduction >= 256 && n_cols_per_block < 256) { if (tid < 128) { sdata[tid] = min(sdata[tid], sdata[tid + 128]); } __syncthreads(); }
 	if (n_threads_reduction >= 128 && n_cols_per_block < 128) { if (tid <  64) { sdata[tid] = min(sdata[tid], sdata[tid + 64]); } __syncthreads(); }
 	if (tid < 32) min_in_cols_warp_reduce(sdata, tid);
-	if (tid < n_cols_per_block) min_in_mat_col[bid*n_cols_per_block + tid] = sdata[tid];
+	if (tid < n_cols_per_block) min_in_cols[bid*n_cols_per_block + tid] = sdata[tid];
 }
 
-__global__ void step_1_sub_row()
+__global__ void step_1_row_sub()
 {
 
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
 	int l = i & row_mask;
 
-	slack[i] = max_in_mat_row[l] - slack[i];  // subtract the minimum in row from that row
+	slack[i] = slack[i] - min_in_rows[l];  // subtract the minimum in row from that row
 
 }
 
@@ -277,9 +313,10 @@ __global__ void step_1_col_sub()
 {
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
 	int c = i >> log2_n;
-	slack[i] = slack[i] - min_in_mat_col[c]; // subtract the minimum in row from that row
+	slack[i] = slack[i] - min_in_cols[c]; // subtract the minimum in row from that row
 
-	if (i == 0) zeros_vector_size = 0;
+	if (i == 0) zeros_size = 0;
+	if (i < n_blocks_step_4) zeros_size_b[i] = 0;
 }
 
 // Compress matrix
@@ -287,8 +324,11 @@ __global__ void compress_matrix(){
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
 
 	if (slack[i] == 0) {
-		int j = atomicAdd(&zeros_vector_size, 1);
-		zeros[j] = i;
+		atomicAdd(&zeros_size, 1);
+		int b = i >> log2_data_block_size;
+		int i0 = i & ~(data_block_size - 1);		// == b << log2_data_block_size
+		int j = atomicAdd(zeros_size_b + b, 1);
+		zeros[i0 + j] = i;
 	}
 }
 
@@ -296,26 +336,32 @@ __global__ void compress_matrix(){
 // Find a zero of slack. If there are no starred zeros in its
 // column or row star the zero. Repeat for each zero.
 
+// The zeros are split through blocks of data so we run step 2 with several thread blocks and rerun the kernel if repeat was set to true.
 __global__ void step_2()
 {
 	int i = threadIdx.x;
-	bool repeat;
+	int b = blockIdx.x;
+	__shared__ bool repeat;
+	__shared__ bool s_repeat_kernel;
+
+	if (i == 0) s_repeat_kernel = false;
 
 	do {
-		repeat = false;
+		__syncthreads();
+		if (i == 0) repeat = false;
 		__syncthreads();
 
-		for (int j = i; j < zeros_vector_size; j += blockDim.x)
+		for (int j = i; j < zeros_size_b[b]; j += blockDim.x)
 		{
-			int z = zeros[j];
+			int z = zeros[(b << log2_data_block_size) + j];
 			int l = z & row_mask;
 			int c = z >> log2_n;
 
 			if (cover_row[l] == 0 && cover_column[c] == 0) {
 				// thread trys to get the line
-				if (!atomicExch(&(cover_row[l]), 1)){
+				if (!atomicExch((int *)&(cover_row[l]), 1)){
 					// only one thread gets the line
-					if (!atomicExch(&(cover_column[c]), 1)){
+					if (!atomicExch((int *)&(cover_column[c]), 1)){
 						// only one thread gets the column
 						row_of_star_at_column[c] = l;
 						column_of_star_at_row[l] = c;
@@ -323,16 +369,18 @@ __global__ void step_2()
 					else {
 						cover_row[l] = 0;
 						repeat = true;
+						s_repeat_kernel = true;
 					}
 				}
 			}
 		}
 		__syncthreads();
 	} while (repeat);
+
+	if (s_repeat_kernel) repeat_kernel = true;
 }
 
 // STEP 3
-
 // uncover all the rows and columns before going to step 3
 __global__ void step_3ini()
 {
@@ -352,7 +400,6 @@ __global__ void step_3()
 		cover_column[i] = 1;
 		atomicAdd((int*)&n_matches, 1);
 	}
-	
 }
 
 // STEP 4
@@ -366,51 +413,61 @@ __global__ void step_3()
 __global__ void step_4_init()
 {
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
-	column_of_prime_at_row[i] =-1;
+	column_of_prime_at_row[i] = -1;
 	row_of_green_at_column[i] = -1;
-	column_of_zero_at_row[i] = -1;
 }
 
-// Maps the uncovered zeros into column_of_zero_at_row
-__global__ void step_4a(){
-	int i = blockDim.x * blockIdx.x + threadIdx.x;
+__global__ void step_4() {
+	__shared__	bool s_found;
+	__shared__	bool s_goto_5;
+	__shared__	bool s_repeat_kernel;
+	volatile int *v_cover_row = cover_row;
+	volatile int *v_cover_column = cover_column;
 
-	if (i < zeros_vector_size) {
-		int z = zeros[i];
-
-		int l = z & row_mask;
-		int c = z >> log2_n;
-
-		if (!cover_row[l] && !cover_column[c]){
-			column_of_zero_at_row[l] = c;
-			found = true; // This is set to false in 4b and at initialization.
-		}
-	}
+	int i = threadIdx.x;
+	int b = blockIdx.x;
+	// int limit; my__syncthreads_init(limit);
 
 	if (i == 0) {
-		goto_5 = false;
-	}
-}
-
-// The rest of step 4
-__global__ void step_4b(){
-	int l = blockDim.x * blockIdx.x + threadIdx.x;
-
-	int c0 = column_of_zero_at_row[l];
-	if (c0>=0)
-	{
-		column_of_prime_at_row[l] = c0;
-		int c = column_of_star_at_row[l];
-		if (c >= 0) {
-			cover_row[l] = 1;
-			cover_column[c] = 0;
-			found = false;
-		}
-		else
-			goto_5 = true;
+		s_repeat_kernel = false;
+		s_goto_5 = false;
 	}
 
-	column_of_zero_at_row[l] = -1;
+	do {
+		__syncthreads();
+		if (i == 0) s_found = false;
+		__syncthreads();
+
+		for (int j = i; j < zeros_size_b[b]; j += blockDim.x)
+		{
+			int z = zeros[(b << log2_data_block_size) + j];
+			int l = z & row_mask;
+			int c = z >> log2_n;
+			int c1 = column_of_star_at_row[l];
+
+			for (int n = 0; n < 10; n++) {
+
+				if (!v_cover_column[c] && !v_cover_row[l]) {
+					s_found = true; s_repeat_kernel = true;
+					column_of_prime_at_row[l] = c;
+
+					if (c1 >= 0) {
+						v_cover_row[l] = 1;
+						__threadfence();
+						v_cover_column[c1] = 0;
+					}
+					else {
+						s_goto_5 = true;
+					}
+				}
+			} // for(int n
+
+		} // for(int j
+		__syncthreads();
+	} while (s_found && !s_goto_5);
+
+	if (i == 0 && s_repeat_kernel) repeat_kernel = true;
+	if (i == 0 && s_goto_5) goto_5 = true;
 }
 
 /* STEP 5:
@@ -424,7 +481,6 @@ that has no starred zero in its column. Unstar each starred
 zero of the series, star each primed zero of the series, erase
 all primes and uncover every line in the matrix. Return to Step 3.*/
 
-
 // Eliminates joining paths
 __global__ void step_5a()
 {
@@ -433,10 +489,10 @@ __global__ void step_5a()
 	int r_Z0, c_Z0;
 
 	c_Z0 = column_of_prime_at_row[i];
-	if (c_Z0 >= 0 && column_of_star_at_row[i] < 0){
+	if (c_Z0 >= 0 && column_of_star_at_row[i] < 0) {
 		row_of_green_at_column[c_Z0] = i;
 
-		while ((r_Z0 = row_of_star_at_column[c_Z0]) >= 0){
+		while ((r_Z0 = row_of_star_at_column[c_Z0]) >= 0) {
 			c_Z0 = column_of_prime_at_row[r_Z0];
 			row_of_green_at_column[c_Z0] = r_Z0;
 		}
@@ -452,7 +508,7 @@ __global__ void step_5b()
 
 	r_Z0 = row_of_green_at_column[j];
 
-	if (r_Z0 >= 0 && row_of_star_at_column[j] < 0){
+	if (r_Z0 >= 0 && row_of_star_at_column[j] < 0) {
 
 		c_Z2 = column_of_star_at_row[r_Z0];
 
@@ -464,7 +520,7 @@ __global__ void step_5b()
 			c_Z0 = c_Z2;							// col of Z2
 			c_Z2 = column_of_star_at_row[r_Z0];		// col of Z4
 
-			// star Z2
+													// star Z2
 			column_of_star_at_row[r_Z0] = c_Z0;
 			row_of_star_at_column[c_Z0] = r_Z0;
 		}
@@ -551,143 +607,198 @@ __global__ void step_6_add_sub()
 	if (cover_row[l] == 0 && cover_column[c] == 0)
 		slack[i] -= d_min_in_mat;
 
-	if (i == 0) zeros_vector_size = 0;
+	if (i == 0) zeros_size = 0;
+	if (i < n_blocks_step_4) zeros_size_b[i] = 0;
 }
 
 __global__ void min_reduce_kernel1() {
-	min_reduce1<n_threads_reduction>(slack, d_min_in_mat_vect, nrow*ncol);
+	min_reduce1<n_threads_reduction>(slack, d_min_in_mat_vect, nrows*ncols);
 }
 
 __global__ void min_reduce_kernel2() {
 	min_reduce2<n_threads_reduction / 2>(d_min_in_mat_vect, &d_min_in_mat, n_blocks_reduction);
 }
 
-// Hungarian_Algorithm
-// This function is run on the device if device if dynamic parallelism is enabled,
-// or in the host if it is disabled (SM20).
+__device__ inline long long int d_get_globaltime(void) {
+	long long int ret;
 
-#ifdef SM20
-void Hungarian_Algorithm()
-#else
-__global__ void Hungarian_Algorithm()
-#endif
-{
-	// Initialization
-	Init << < n_blocks, n_threads >> > ();
-	checkCuda(cudaDeviceSynchronize());
+	asm volatile ("mov.u64 %0, %%globaltimer;" : "=l"(ret));
 
-	// Step 1 kernels
-	max_in_rows << < n_blocks_reduction, n_threads_reduction >> >();
-	checkCuda(cudaDeviceSynchronize());
-	step_1_sub_row << <n_blocks_full, n_threads_full >> >();
-	checkCuda(cudaDeviceSynchronize());
+	return ret;
+}
 
-	min_in_cols << < n_blocks_reduction, n_threads_reduction >> >();
-	checkCuda(cudaDeviceSynchronize());
-	step_1_col_sub << <n_blocks_full, n_threads_full >> >();
-	checkCuda(cudaDeviceSynchronize());
-
-	// compress_matrix
-	compress_matrix << < n_blocks_full, n_threads_full >> > ();
-	checkCuda(cudaDeviceSynchronize());
-
-	// Step 2 kernels
-	step_2 << <1, min(max_threads_per_block, nrow) >> > ();
-	checkCuda(cudaDeviceSynchronize());
-
-	while (1) {  // repeat steps 3 to 6
-
-		// Step 3 kernels
-		step_3ini << <n_blocks, n_threads >> >();
-		checkCuda(cudaDeviceSynchronize());
-		step_3 << <n_blocks, n_threads >> > ();
-		checkCuda(cudaDeviceSynchronize());
-
-#ifdef SM20
-		cudaMemcpyFromSymbol(&h_n_matches, n_matches, sizeof(int));
-		if (h_n_matches >= ncol) return;		// It's done
-#else
-		if (n_matches >= ncol) return;			// It's done
-#endif
-
-		//step 4_kernels
-		step_4_init << <n_blocks, n_threads >> > ();
-		checkCuda(cudaDeviceSynchronize());
-
-		while (1) // repeat step 4 and 6
-		{
-			do {  // step 4 loop
-#ifdef SM20
-				cudaMemcpyFromSymbol(&h_zeros_vector_size, zeros_vector_size, sizeof(int));
-				if (h_zeros_vector_size > 100 * n)
-					step_4a << < n_blocks_full, n_threads_full >> > ();
-				else if (h_zeros_vector_size > 10 * n)
-					step_4a << < 100 * n / n_threads, n_threads >> > ();
-				else
-					step_4a << < 10 * n / n_threads, n_threads >> > ();
-
-#else
-				if (zeros_vector_size>100 * n)
-					step_4a << < n_blocks_full, n_threads_full >> > ();
-				else if (zeros_vector_size>10 * n)
-					step_4a << < 100 * n / n_threads, n_threads >> > ();
-				else
-					step_4a << < 10 * n / n_threads, n_threads >> > ();
-
-#endif
-				checkCuda(cudaDeviceSynchronize());
-#ifdef SM20
-				cudaMemcpyFromSymbol(&h_found, found, sizeof(bool));
-				if (!h_found) break;
-#else
-				if (!found) break;
-#endif
-
-				step_4b << < n_blocks, n_threads >> >();
-				checkCuda(cudaDeviceSynchronize());
-#ifdef SM20
-				cudaMemcpyFromSymbol(&h_goto_5, goto_5, sizeof(bool));
-
-			} while (!h_goto_5);
-#else
-			} while (!goto_5);
-#endif
-
-#ifdef SM20
-			cudaMemcpyFromSymbol(&h_goto_5, goto_5, sizeof(bool));
-			if (h_goto_5) break; // Or if (!h_found)
-#else
-			if (goto_5) break;	// Or if (!found)
-#endif
-
-			//step 6_kernel
-			min_reduce_kernel1 << <n_blocks_reduction, n_threads_reduction, n_threads_reduction*sizeof(int) >> >();
-			checkCuda(cudaDeviceSynchronize());
-			min_reduce_kernel2 << <1, n_blocks_reduction / 2, (n_blocks_reduction / 2) * sizeof(int) >> >();
-			checkCuda(cudaDeviceSynchronize());
-			step_6_add_sub << <n_blocks_full, n_threads_full >> >();
-			checkCuda(cudaDeviceSynchronize());
-
-			//compress_matrix
-			compress_matrix << < n_blocks_full, n_threads_full >> > ();
-			checkCuda(cudaDeviceSynchronize());
-
-		} // repeat step 4 and 6
-
-		step_5a << < n_blocks, n_threads >> > ();
-		checkCuda(cudaDeviceSynchronize());
-		step_5b << < n_blocks, n_threads >> > ();
-		checkCuda(cudaDeviceSynchronize());
-
-	}  // repeat steps 3 to 6
+// Returns the period in miliseconds
+__device__ inline double d_get_timer_period(void) {
+	return 1.0e-6;
 }
 
 // -------------------------------------------------------------------------------------
 // Host code
 // -------------------------------------------------------------------------------------
 
+// Convenience function for checking CUDA runtime API results
+// can be wrapped around any runtime API call. No-op in release builds.
+inline cudaError_t checkCuda(cudaError_t result)
+{
+#if defined(DEBUG) || defined(_DEBUG)
+	if (result != cudaSuccess) {
+		printf("CUDA Runtime Error: %s\n",
+			cudaGetErrorString(result));
+		assert(result == cudaSuccess);
+	}
+#endif
+	return result;
+};
+
+typedef std::chrono::high_resolution_clock::rep hr_clock_rep;
+
+inline hr_clock_rep get_globaltime(void) {
+	using namespace std::chrono;
+	return high_resolution_clock::now().time_since_epoch().count();
+}
+
+// Returns the period in miliseconds
+inline double get_timer_period(void) {
+	using namespace std::chrono;
+	return 1000.0 * high_resolution_clock::period::num / high_resolution_clock::period::den;
+}
+
+#define declare_kernel(k)						\
+	hr_clock_rep k##_time = 0;						\
+	int k##_runs = 0
+
+#define call_kernel(k, n_blocks, n_threads)		call_kernel_s(k, n_blocks, n_threads, 0ll)
+
+#define call_kernel_s(k, n_blocks, n_threads, shared)	\
+{														\
+	timer_start = dh_get_globaltime();					\
+	k << < n_blocks, n_threads,  shared>> > ();			\
+	dh_checkCuda(cudaDeviceSynchronize());					\
+	timer_stop = dh_get_globaltime();					\
+	k##_time += timer_stop - timer_start;				\
+	k##_runs++;											\
+}
+// printf("Finished kernel " #k "(%d,%d,%lld)\n", n_blocks, n_threads, shared);			\
+// fflush(0);											\
+
+#define kernel_stats(k)						\
+	printf(#k "\t %g \t %d\n", dh_get_timer_period() * k##_time, k##_runs)
+
+// Hungarian_Algorithm
+#ifndef DYNAMIC
+void Hungarian_Algorithm()
+#else
+__global__ void Hungarian_Algorithm()
+#endif 
+{
+	hr_clock_rep timer_start, timer_stop;
+	hr_clock_rep total_time_start, total_time_stop;
+#if defined(DEBUG) || defined(_DEBUG)
+	int last_n_covered_rows = 0, last_n_matches = 0;
+#endif
+
+	declare_kernel(init); 
+	declare_kernel(calc_min_in_rows); declare_kernel(step_1_row_sub);
+	declare_kernel(calc_min_in_cols); declare_kernel(step_1_col_sub);
+	declare_kernel(compress_matrix);
+	declare_kernel(step_2); 
+	declare_kernel(step_3ini); declare_kernel(step_3);
+	declare_kernel(step_4_init); declare_kernel(step_4);
+	declare_kernel(min_reduce_kernel1); declare_kernel(min_reduce_kernel2); declare_kernel(step_6_add_sub);
+	declare_kernel(step_5a); declare_kernel(step_5b); declare_kernel(step_5c);
+
+	total_time_start = dh_get_globaltime();
+
+	// Initialization
+	call_kernel(init, n_blocks, n_threads);
+
+	// Step 1 kernels
+	call_kernel(calc_min_in_rows, n_blocks_reduction, n_threads_reduction);
+	call_kernel(step_1_row_sub, n_blocks_full, n_threads_full);
+	call_kernel(calc_min_in_cols, n_blocks_reduction, n_threads_reduction);
+	call_kernel(step_1_col_sub, n_blocks_full, n_threads_full);
+
+	// compress_matrix
+	call_kernel(compress_matrix, n_blocks_full, n_threads_full);
+
+	// Step 2 kernels
+	do {
+		repeat_kernel = false; dh_checkCuda(cudaDeviceSynchronize());
+		call_kernel(step_2, n_blocks_step_4, (n_blocks_step_4 > 1 || zeros_size > max_threads_per_block) ? max_threads_per_block : zeros_size);
+		// If we have more than one block it means that we have 512 lines per block so 1024 threads should be adequate.
+	} while (repeat_kernel);
+
+	while (1) {  // repeat steps 3 to 6
+
+		// Step 3 kernels
+		call_kernel(step_3ini, n_blocks, n_threads);
+		call_kernel(step_3, n_blocks, n_threads);
+
+		if (n_matches >= ncols) break;			// It's done
+
+		//step 4_kernels
+		call_kernel(step_4_init, n_blocks, n_threads);
+
+		while (1) // repeat step 4 and 6
+		{
+#if defined(DEBUG) || defined(_DEBUG)
+			// At each iteraton either the number of matched or covered rows has to increase.
+			// If we went to step 5 the number of matches increases.
+			// If we went to step 6 the number of covered rows increases.
+			n_covered_rows = 0; n_covered_columns = 0;
+			dh_checkCuda(cudaDeviceSynchronize());
+			convergence_check << < n_blocks, n_threads >> > ();
+			dh_checkCuda(cudaDeviceSynchronize());
+			assert(n_matches>last_n_matches || n_covered_rows>last_n_covered_rows);
+			assert(n_matches == n_covered_columns + n_covered_rows);
+			last_n_matches = n_matches;
+			last_n_covered_rows = n_covered_rows;
+#endif
+			do {  // step 4 loop
+				goto_5 = false; repeat_kernel = false; 
+				dh_checkCuda(cudaDeviceSynchronize());
+				
+				call_kernel(step_4, n_blocks_step_4, (n_blocks_step_4 > 1 || zeros_size > max_threads_per_block) ? max_threads_per_block : zeros_size);
+				// If we have more than one block it means that we have 512 lines per block so 1024 threads should be adequate.
+
+			} while (repeat_kernel && !goto_5);
+
+			if (goto_5) break;
+
+			//step 6_kernel
+			call_kernel_s(min_reduce_kernel1, n_blocks_reduction, n_threads_reduction, n_threads_reduction*sizeof(int));
+			call_kernel_s(min_reduce_kernel2, 1, n_blocks_reduction / 2, (n_blocks_reduction / 2) * sizeof(int));
+			call_kernel(step_6_add_sub, n_blocks_full, n_threads_full);
+
+			//compress_matrix
+			call_kernel(compress_matrix, n_blocks_full, n_threads_full);
+
+		} // repeat step 4 and 6
+
+		call_kernel(step_5a, n_blocks, n_threads);
+		call_kernel(step_5b, n_blocks, n_threads);
+
+	}  // repeat steps 3 to 6
+
+	total_time_stop = dh_get_globaltime();
+
+	printf("kernel \t time (ms) \t runs\n");
+
+	kernel_stats(init);
+	kernel_stats(calc_min_in_rows); kernel_stats(step_1_row_sub);
+	kernel_stats(calc_min_in_cols); kernel_stats(step_1_col_sub);
+	kernel_stats(compress_matrix);
+	kernel_stats(step_2);
+	kernel_stats(step_3ini); kernel_stats(step_3);
+	kernel_stats(step_4_init); kernel_stats(step_4);
+	kernel_stats(min_reduce_kernel1); kernel_stats(min_reduce_kernel2); kernel_stats(step_6_add_sub);
+	kernel_stats(step_5a); kernel_stats(step_5b); kernel_stats(step_5c);
+
+	printf("Total time(ms) \t %g\n", dh_get_timer_period() * (total_time_stop - total_time_start));
+}
+
 // Used to make sure some constants are properly set
-void check(bool val, char *str){
+void check(bool val, const char *str){
 	if (!val) {
 		printf("Check failed: %s!\n", str);
 		getchar();
@@ -707,43 +818,92 @@ int main()
 	check(n_threads_reduction*n_blocks_reduction <= n*n, "Step 1: The grid size is bigger than the matrix size!");
 	// step 6
 	check(n_threads_full*n_blocks_full <= n*n, "Step 6: The grid size is bigger than the matrix size!");
+	check(columns_per_block_step_4*n == (1 << log2_data_block_size), "Columns per block of step 4 is not a power of two!");
+
+	printf("Running. See out.txt for output.\n");
+
+	// Open text file
+	FILE *file = freopen("out.txt", "w", stdout);
+	if (file == NULL)
+	{
+		perror("Error opening the output file!\n");
+		getchar();
+		exit(1);
+	};
+
+	// Prints the current time
+	time_t current_time;
+	time(&current_time);
+	printf("%s\n", ctime(&current_time));
+	fflush(file);
 
 #ifndef USE_TEST_MATRIX
 	std::default_random_engine generator(seed);
 	std::uniform_int_distribution<int> distribution(0, range-1);
 	
-	for (int c = 0; c < ncol; c++)
-		for (int r = 0; r < nrow; r++) {
-			pay[c][r] = distribution(generator);
-		}
-#endif
-	
-	// Copy vectors from host memory to device memory
-	cudaMemcpyToSymbol(slack, pay, sizeof(data)*nrow*ncol); // symbol refers to the device memory hence "To" means from Host to Device
-	
-	// Invoke kernels
-	
-	time_t start_time = clock();
+	for (int test = 0; test < n_tests; test++) {
+		printf("\n\n\n\ntest %d\n", test);
+		fflush(file);
 
-#ifdef SM20
-	Hungarian_Algorithm();
+		for (int c = 0; c < ncols; c++)
+			for (int r = 0; r < nrows; r++) {
+				pay[c][r] = distribution(generator);
+			}
+#endif
+
+		data max = 0;
+		for (int c = 0; c < ncols; c++)
+			for (int r = 0; r < nrows; r++) {
+				data x = pay[c][r];
+				if (x > max) max = x;
+			}
+
+		for (int c = 0; c < ncols; c++)
+			for (int r = 0; r < nrows; r++) {
+				h_cost[c][r] = max - pay[c][r];
+			}
+
+		// Copy vectors from host memory to device memory
+		cudaMemcpyToSymbol(slack, h_cost, sizeof(data)*nrows*ncols); // symbol refers to the device memory hence "To" means from Host to Device
+
+		// Invoke kernels
+
+		time_t start_time = clock();
+
+		cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 1024 *1024 * 1024);
+
+#ifndef DYNAMIC
+		Hungarian_Algorithm();
 #else
-	Hungarian_Algorithm << < 1, 1 >> > ();
+		Hungarian_Algorithm << <1, 1 >> > ();
+#endif 
+		checkCuda(cudaDeviceSynchronize());
+
+		time_t stop_time = clock();
+		fflush(file);
+
+		// Copy assignments from Device to Host and calculate the total Cost
+		cudaMemcpyFromSymbol(h_column_of_star_at_row, column_of_star_at_row, nrows * sizeof(int));
+
+		int total_pay = 0;
+		for (int r = 0; r < nrows; r++) {
+			int c = h_column_of_star_at_row[r];
+			if (c >= 0) total_pay += pay[c][r];
+		}
+
+		int total_cost = 0;
+		for (int r = 0; r < nrows; r++) {
+			int c = h_column_of_star_at_row[r];
+			if (c >= 0) total_cost += h_cost[c][r];
+		}
+
+		printf("Total pay is \t %d \n", total_pay);
+		printf("Total cost is \t %d \n", total_cost);
+		printf("Low resolution time is \t %f \n", 1000.0*(double)(stop_time - start_time) / CLOCKS_PER_SEC);
+
+#ifndef USE_TEST_MATRIX
+	} // for (int test
 #endif
-	cudaDeviceSynchronize();
 
-	time_t stop_time = clock();
-
-	// Copy assignments from Device to Host and calculate the total Cost.
-	cudaMemcpyFromSymbol(h_column_of_star_at_row, column_of_star_at_row, nrow*sizeof(int));
-
-	int total_pay = 0;
-	for (int r = 0; r < nrow; r++) {
-		int c = h_column_of_star_at_row[r];
-		if (c >= 0) total_pay += pay[c][r];
-	}
-
-	printf("Total pay is: %d \n", total_pay);
-	printf("Elapsed time: %f ms\n", 1000.0*(double)(stop_time - start_time) / CLOCKS_PER_SEC);
-	printf("Note: This time measurment is portable but very inaccurate!\n");
+	fclose(file);
 }
