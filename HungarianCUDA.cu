@@ -54,7 +54,7 @@
 // #define USE_TEST_MATRIX
 
 // Comment to use managed variables instead of dynamic parallelism; usefull for debugging
-#define DYNAMIC
+// #define DYNAMIC
 
 #ifndef USE_TEST_MATRIX
 #ifdef _n_
