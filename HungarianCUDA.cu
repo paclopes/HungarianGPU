@@ -35,7 +35,6 @@
 // and subtract it from every element of each uncovered column.
 // Return to Step 4 without altering any stars, primes, or covered rows.
 
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -56,20 +55,7 @@
 // Comment to use managed variables instead of dynamic parallelism; usefull for debugging
 // #define DYNAMIC
 
-#ifndef USE_TEST_MATRIX
-#ifdef _n_
-// These values are meant to be changed by scripts
-const int n = _n_;							// size of the cost/pay matrix
-const int range = _range_;					// defines the range of the random matrix.
-const int n_tests = 100;
-#else
-// User inputs: These values should be changed by the user
-const int n = 2048;						// size of the cost/pay matrix
-const int range = n;					// defines the range of the random matrix.
-const int n_tests = 10;					// defines the number of tests performed
-#endif
-
-// End of user inputs
+#define klog2(n) ((n<8)?2:((n<16)?3:((n<32)?4:((n<64)?5:((n<128)?6:((n<256)?7:((n<512)?8:((n<1024)?9:((n<2048)?10:((n<4096)?11:((n<8192)?12:((n<16384)?13:0))))))))))))
 
 #ifndef DYNAMIC
 #define MANAGED __managed__ 
@@ -83,9 +69,24 @@ const int n_tests = 10;					// defines the number of tests performed
 #define MANAGED
 #endif
 
-#define klog2(n) ((n==8)?3:((n==16)?4:((n==32)?5:((n==64)?6:((n==128)?7:((n==256)?8:((n==512)?9:((n==1024)?10:((n==2048)?11:((n==4096)?12:(n==8192)?13:0))))))))))
 #define kmin(x,y) ((x<y)?x:y)
 #define kmax(x,y) ((x>y)?x:y)
+
+#ifndef USE_TEST_MATRIX
+#ifdef _n_
+// These values are meant to be changed by scripts
+const int n = _n_;							// size of the cost/pay matrix
+const int range = _range_;					// defines the range of the random matrix.
+const int n_tests = 100;
+#else
+// User inputs: These values should be changed by the user
+const int user_n = 1000;				// This is the size of the cost matrix as supplied by the user
+const int n = 1<<(klog2(user_n)+1);		// The size of the cost/pay matrix used in the algorithm that is increased to a power of two
+const int range = n;					// defines the range of the random matrix.
+const int n_tests = 10;					// defines the number of tests performed
+#endif
+
+// End of user inputs
 
 const int log2_n = klog2(n);			// log2(n)
 const int n_threads = kmin(n,64);		// Number of threads used in small kernels grid size (typically grid size equal to n)
@@ -132,11 +133,10 @@ typedef unsigned char data;
 // Device variables have no prefix.
 
 #ifndef USE_TEST_MATRIX
-data pay[ncols][nrows];
-#else
-data pay[n][n] = { { 1, 2, 3, 4 }, { 2, 4, 6, 8 }, { 3, 6, 9, 12 }, { 4, 8, 12, 16 } };
-#endif
 data h_cost[ncols][nrows];
+#else
+data h_cost[n][n] = { { 1, 2, 3, 4 }, { 2, 4, 6, 8 }, { 3, 6, 9, 12 }, { 4, 8, 12, 16 } };
+#endif
 int h_column_of_star_at_row[nrows];
 int h_zeros_vector_size;
 int h_n_matches;
@@ -847,21 +847,14 @@ int main()
 
 		for (int c = 0; c < ncols; c++)
 			for (int r = 0; r < nrows; r++) {
-				pay[c][r] = distribution(generator);
+				if (c < user_n && r < user_n)
+					h_cost[c][r] = distribution(generator);
+				else {
+					if (c == r) h_cost[c][r] = 0;
+					else h_cost[c][r] = MAX_DATA;
+				}
 			}
 #endif
-
-		data max = 0;
-		for (int c = 0; c < ncols; c++)
-			for (int r = 0; r < nrows; r++) {
-				data x = pay[c][r];
-				if (x > max) max = x;
-			}
-
-		for (int c = 0; c < ncols; c++)
-			for (int r = 0; r < nrows; r++) {
-				h_cost[c][r] = max - pay[c][r];
-			}
 
 		// Copy vectors from host memory to device memory
 		cudaMemcpyToSymbol(slack, h_cost, sizeof(data)*nrows*ncols); // symbol refers to the device memory hence "To" means from Host to Device
@@ -885,19 +878,12 @@ int main()
 		// Copy assignments from Device to Host and calculate the total Cost
 		cudaMemcpyFromSymbol(h_column_of_star_at_row, column_of_star_at_row, nrows * sizeof(int));
 
-		int total_pay = 0;
-		for (int r = 0; r < nrows; r++) {
-			int c = h_column_of_star_at_row[r];
-			if (c >= 0) total_pay += pay[c][r];
-		}
-
 		int total_cost = 0;
 		for (int r = 0; r < nrows; r++) {
 			int c = h_column_of_star_at_row[r];
 			if (c >= 0) total_cost += h_cost[c][r];
 		}
 
-		printf("Total pay is \t %d \n", total_pay);
 		printf("Total cost is \t %d \n", total_cost);
 		printf("Low resolution time is \t %f \n", 1000.0*(double)(stop_time - start_time) / CLOCKS_PER_SEC);
 
