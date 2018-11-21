@@ -77,6 +77,7 @@
 // These values are meant to be changed by scripts
 const int n = _n_;							// size of the cost/pay matrix
 const int range = _range_;					// defines the range of the random matrix.
+const int user_n = n;					
 const int n_tests = 100;
 #else
 // User inputs: These values should be changed by the user
@@ -555,12 +556,12 @@ __device__ void min_reduce1(volatile data *g_idata, volatile data *g_odata, unsi
 		int i2 = i + blockSize;
 		int l1 = i1 & row_mask;
 		int c1 = i1 >> log2_n; 
-		int g1;
+		data g1;
 		if (cover_row[l1] == 1 || cover_column[c1] == 1) g1 = MAX_DATA;
 		else g1 = g_idata[i1];
 		int l2 = i2 & row_mask;
 		int c2 = i2 >> log2_n;
-		int g2;
+		data g2;
 		if (cover_row[l2] == 1 || cover_column[c2] == 1) g2 = MAX_DATA;
 		else g2 = g_idata[i2];
 		sdata[tid] = min(sdata[tid], min(g1, g2));
